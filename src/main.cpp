@@ -1,86 +1,161 @@
-// I2C device class (I2Cdev) demonstration Arduino sketch for ITG3200 class
-// 10/7/2011 by Jeff Rowberg <jeff@rowberg.net>
-// Updates should (hopefully) always be available at https://github.com/jrowberg/i2cdevlib
-//
-// Changelog:
-//     2011-10-07 - initial release
-
-/* ============================================
-I2Cdev device library code is placed under the MIT license
-Copyright (c) 2011 Jeff Rowberg
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-===============================================
-*/
-
-// Arduino Wire library is required if I2Cdev I2CDEV_ARDUINO_WIRE implementation
-// is used in I2Cdev.h
 #include "Wire.h"
-
-// I2Cdev and ITG3200 must be installed as libraries, or else the .cpp/.h files
-// for both classes must be in the include path of your project
 #include "I2Cdev.h"
 #include "ITG3200.h"
+#include "ADXL345.h"
+#include <QMC5883LCompass.h>
 
-// class default I2C address is 0x68
-// specific I2C addresses may be passed as a parameter here
-// AD0 low = 0x68 (default for SparkFun 6DOF board)
-// AD0 high = 0x69 (default for SparkFun ITG-3200 standalone board)
 ITG3200 gyro;
+ADXL345 accel;
+QMC5883LCompass compass;
 
-int16_t gx, gy, gz;
+int16_t gxRaw, gyRaw, gzRaw; // Raw gyroscope readings
+int16_t axRaw, ayRaw, azRaw; // Raw accelerometer readings
+int16_t mxRaw, myRaw, mzRaw; // Raw magnetometer readings
 
-#define LED_PIN 13
-bool blinkState = false;
+// Mahony filter variables
+float Kp = 2.0f; // Proportional gain (tuned for responsiveness)
+float Ki = 0.05f; // Integral gain (tuned for drift correction)
+float integralFBx = 0.0f, integralFBy = 0.0f, integralFBz = 0.0f;
+
+// Quaternion and timing
+float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+unsigned long lastUpdate = 0;
+
+void mahonyUpdate(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float dt);
+void quaternionToEuler(float &roll, float &pitch, float &yaw);
 
 void setup() {
-    // join I2C bus (I2Cdev library doesn't do this automatically)
-    Wire.begin();
+  Wire.begin();
+  Serial.begin(115200);
 
-    // initialize serial communication
-    // (38400 chosen because it works as well at 8MHz as it does at 16MHz, but
-    // it's really up to you depending on your project)
-    Serial.begin(9600);
+  // Initialize sensors
+  gyro.initialize();
+  accel.initialize();
+  compass.init();
+  
+  // Set sensor ranges (important for unit conversion)
+  accel.setRange(ADXL345_RANGE_4G);
+  gyro.setFullScaleRange(ITG3200_FULLSCALE_2000);
+  compass.setCalibrationOffsets(10.00, -49.00, 85.00);
+  compass.setCalibrationScales(1.03, 0.90, 1.09);
 
-    // initialize device
-    Serial.println("Initializing I2C devices...");
-    gyro.initialize();
-
-    // verify connection
-    Serial.println("Testing device connections...");
-    Serial.println(gyro.testConnection() ? "ITG3200 connection successful" : "ITG3200 connection failed");
-
-    // configure Arduino LED pin for output
-    pinMode(LED_PIN, OUTPUT);
+  lastUpdate = millis();
 }
 
 void loop() {
-    // read raw gyro measurements from device
-    gyro.getRotation(&gx, &gy, &gz);
+  // Calculate actual time step
+  unsigned long now = millis();
+  float dt = (now - lastUpdate) / 1000.0f;
+  lastUpdate = now;
 
-    // display tab-separated gyro x/y/z values
-    Serial.print("gyro:\t");
-    Serial.print(gx); Serial.print("\t");
-    Serial.print(gy); Serial.print("\t");
-    Serial.println(gz);
+  // Read raw sensor data
+  gyro.getRotation(&gxRaw, &gyRaw, &gzRaw);
+  accel.getAcceleration(&axRaw, &ayRaw, &azRaw);
+  compass.read();
+  mxRaw = compass.getX();
+  myRaw = compass.getY();
+  mzRaw = compass.getZ();
 
-    // blink LED to indicate activity
-    blinkState = !blinkState;
-    digitalWrite(LED_PIN, blinkState);
+  // Convert sensor data to proper units
+  // Gyro: degrees/s -> radians/s
+  float gx = gxRaw * (M_PI / 180.0f);
+  float gy = gyRaw * (M_PI / 180.0f);
+  float gz = gzRaw * (M_PI / 180.0f);
+
+  // Accelerometer: raw -> m/s² (assuming 4G range)
+  float ax = axRaw * 0.0039f * 9.81f;
+  float ay = ayRaw * 0.0039f* 9.81f;
+  float az = azRaw * 0.0039f * 9.81f;
+
+  // Magnetometer: raw -> μT (calibrated)
+  float mx = mxRaw * 0.15f; // QMC5883L sensitivity: 0.15 μT/LSB
+  float my = myRaw * 0.15f;
+  float mz = mzRaw * 0.15f;
+
+  // Update Mahony filter
+  mahonyUpdate(gx, gy, gz, ax, ay, az, mx, my, mz, dt);
+
+  // Convert to Euler angles
+  float roll, pitch, yaw;
+  quaternionToEuler(roll, pitch, yaw);
+
+  // Print results
+
+  Serial.print("Orientation: ");
+  Serial.print(roll); Serial.print(" ");
+  Serial.print(pitch); Serial.print(" ");
+  Serial.println(yaw);
+  
+
+  // Maintain ~100Hz update rate
+  if (dt < 0.01) delay(10 - (millis() - now));
+}
+
+// Improved Mahony AHRS implementation
+void mahonyUpdate(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float dt) {
+  float norm;
+  float hx, hy, hz, bx, bz;
+  float vx, vy, vz, wx, wy, wz;
+  float ex, ey, ez;
+
+  // Normalize accelerometer measurement
+  norm = sqrt(ax * ax + ay * ay + az * az);
+  if (norm == 0) return;
+  ax /= norm; ay /= norm; az /= norm;
+
+  // Normalize magnetometer measurement
+  norm = sqrt(mx * mx + my * my + mz * mz);
+  if (norm == 0) return;
+  mx /= norm; my /= norm; mz /= norm;
+
+  // Reference direction of Earth's magnetic field
+  hx = 2.0f * (mx * (0.5f - q2*q2 - q3*q3) + my * (q1*q2 - q0*q3) + mz * (q1*q3 + q0*q2));
+  hy = 2.0f * (mx * (q1*q2 + q0*q3) + my * (0.5f - q1*q1 - q3*q3) + mz * (q2*q3 - q0*q1));
+  hz = 2.0f * mx * (q1*q3 - q0*q2) + 2.0f * my * (q2*q3 + q0*q1) + 2.0f * mz * (0.5f - q1*q1 - q2*q2);
+  bx = sqrt(hx*hx + hy*hy);
+  bz = hz;
+
+  // Estimated direction of gravity and magnetic field
+  vx = 2.0f * (q1*q3 - q0*q2);
+  vy = 2.0f * (q0*q1 + q2*q3);
+  vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
+  wx = 2.0f * bx * (0.5f - q2*q2 - q3*q3) + 2.0f * bz * (q1*q3 - q0*q2);
+  wy = 2.0f * bx * (q1*q2 - q0*q3) + 2.0f * bz * (q0*q1 + q2*q3);
+  wz = 2.0f * bx * (q0*q2 + q1*q3) + 2.0f * bz * (0.5f - q1*q1 - q2*q2);
+
+  // Error is cross product between estimated and measured directions
+  ex = (ay*vz - az*vy) + (my*wz - mz*wy);
+  ey = (az*vx - ax*vz) + (mz*wx - mx*wz);
+  ez = (ax*vy - ay*vx) + (mx*wy - my*wx);
+
+  // Integrate error
+  integralFBx += ex * Ki * dt;
+  integralFBy += ey * Ki * dt;
+  integralFBz += ez * Ki * dt;
+
+  // Apply feedback to gyro
+  gx += Kp * ex + integralFBx;
+  gy += Kp * ey + integralFBy;
+  gz += Kp * ez + integralFBz;
+
+  // Integrate quaternion
+  q0 += (-q1*gx - q2*gy - q3*gz) * 0.5f * dt;
+  q1 += (q0*gx + q2*gz - q3*gy) * 0.5f * dt;
+  q2 += (q0*gy - q1*gz + q3*gx) * 0.5f * dt;
+  q3 += (q0*gz + q1*gy - q2*gx) * 0.5f * dt;
+
+  // Normalize quaternion
+  norm = sqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+  if (norm == 0) return;
+  q0 /= norm; q1 /= norm; q2 /= norm; q3 /= norm;
+}
+
+// Convert quaternion to Euler angles in degrees
+void quaternionToEuler(float &roll, float &pitch, float &yaw) {
+  roll = atan2(2.0f * (q0*q1 + q2*q3), 1.0f - 2.0f * (q1*q1 + q2*q2)) * (180.0f / M_PI);
+  pitch = asin(2.0f * (q0*q2 - q3*q1)) * (180.0f / M_PI);
+  yaw = atan2(2.0f * (q0*q3 + q1*q2), 1.0f - 2.0f * (q2*q2 + q3*q3)) * (180.0f / M_PI);
+  
+  // Convert yaw to 0-360° compass heading
+  if (yaw < 0) yaw += 360.0f;
 }
