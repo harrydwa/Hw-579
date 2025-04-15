@@ -72,6 +72,7 @@ void loop() {
   float my = myRaw * 0.15f;
   float mz = mzRaw * 0.15f;
 
+  
   // Update Mahony filter
   mahonyUpdate(gx, gy, gz, ax, ay, az, mx, my, mz, dt);
 
@@ -80,7 +81,7 @@ void loop() {
   quaternionToEuler(roll, pitch, yaw);
 
   // Print results
-
+  
   Serial.print("Orientation: ");
   Serial.print(roll); Serial.print(" ");
   Serial.print(pitch); Serial.print(" ");
